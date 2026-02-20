@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# PID-файл бота
+bot.pid
+
 # Google credentials
 credentials.json
 *-credentials.json

@@ -1,10 +1,45 @@
 import asyncio
 import base64
+import hashlib
 import io
 import logging
 import os
+import random
 import re
+import signal
 from datetime import datetime, timezone
+
+# ── Защита от дублирования: только 1 экземпляр бота ──────────────
+import subprocess as _sp
+
+_PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.pid")
+
+def _kill_old_instance() -> None:
+    my_pid = os.getpid()
+    # 1) По PID-файлу
+    if os.path.exists(_PID_FILE):
+        try:
+            old_pid = int(open(_PID_FILE).read().strip())
+            if old_pid != my_pid:
+                os.kill(old_pid, signal.SIGKILL)
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            pass
+    # 2) По имени процесса — убить все «python … bot.py», кроме себя
+    try:
+        out = _sp.check_output(["pgrep", "-f", "python.*bot\\.py"], text=True)
+        for line in out.strip().splitlines():
+            pid = int(line.strip())
+            if pid != my_pid:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+    except (FileNotFoundError, _sp.CalledProcessError):
+        pass
+    with open(_PID_FILE, "w") as f:
+        f.write(str(my_pid))
+
+_kill_old_instance()
 from typing import Optional, Dict, List, Any, Tuple
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
@@ -30,6 +65,17 @@ CB_NEXT_SURVEY = "next:survey"
 CB_NEXT_UPLOAD = "next:upload"
 # Опрос: кнопка «Отправить ответ»
 CB_SURVEY_SEND = "survey:send"
+# Поток после опроса: запрос → документы → анализ
+CB_SEND_DOCS = "docs:send"
+CB_SHOW_RESULTS = "results:show"
+CB_CONTINUE_YES = "continue:yes"
+CB_CONTINUE_NO = "continue:no"
+# Авторизация / регистрация
+CB_AUTH_LOGIN = "auth:login"
+CB_AUTH_REGISTER = "auth:register"
+CB_FORGOT_PASSWORD = "auth:forgot"
+
+USERS_SHEET_HEADER = ["id", "email", "password", "password_hash", "telegram_id", "telegram_username", "confirmed", "created_at"]
 
 # Единый блок юридического согласия (РФ) — одно сообщение, кнопка «Согласен и продолжить»
 CONSENT_TEXT = """📄 <b>Единый блок юридического согласия (РФ)</b>
@@ -116,20 +162,9 @@ def _ai_choice_keyboard() -> Optional[InlineKeyboardMarkup]:
     return InlineKeyboardMarkup([buttons])
 
 
-# Основная клавиатура (показывается после опроса и в рабочих сценариях)
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("Старт"), KeyboardButton("Стоп"), KeyboardButton("Перезапустить")],
-        [KeyboardButton("Добавить фото"), KeyboardButton("Диагноз"), KeyboardButton("Лечение")],
-    ],
-    resize_keyboard=True,
-)
-
-# Во время опроса внизу только эта кнопка (вместо инлайн под сообщением)
-SURVEY_KEYBOARD = ReplyKeyboardMarkup(
-    [[KeyboardButton("Отправить ответ")]],
-    resize_keyboard=True,
-)
+# Убираем reply-клавиатуру — вместо неё используем ReplyKeyboardRemove
+MAIN_KEYBOARD = ReplyKeyboardRemove()
+SURVEY_KEYBOARD = ReplyKeyboardRemove()
 
 load_dotenv()
 
@@ -139,16 +174,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Google Таблица: каждая отправка опроса — новая строка, столбец дата и время ---
-SHEET_HEADER = ["id", "fio", "birth_year", "дата и время заполнения"] + [f"q{i}" for i in range(1, 46)]
+# --- Google Таблица ---
+# Короткие названия столбцов для каждого вопроса (порядок = MEDICAL_QUESTIONS_FULL)
+_Q_LABELS = [
+    "фио", "год рождения", "пол", "рост", "вес",
+    "соц. статус", "жалоба", "локализация боли", "характер боли", "интенсивность",
+    "длительность", "динамика", "нагрузка", "стресс", "ранее",
+    "скорая", "гипертензия", "ИБС", "инфаркт", "инсульт",
+    "диабет", "ХБП", "ХОБЛ/астма", "онкология", "терапия",
+    "гипотензивные", "антикоагулянты", "инсулин", "приём лекарств", "АД",
+    "температура", "пульс", "отёки", "речь", "онемение",
+    "зрение", "судороги", "потеря сознания", "падение", "удар головой",
+    "потеря сознания (падение)", "таз/шейка бедра", "аллергия лек.", "аллергия пищ.", "анализы",
+    "заключения", "УЗИ/КТ/МРТ", "самочувствие",
+]
+# Заголовок: id | дата | <названия вопросов из активного списка>
+SHEET_HEADER = ["id", "дата", "telegram", "телефон"] + _Q_LABELS[:len(MEDICAL_QUESTIONS)]
 
 
-def _sheet_append_and_get_id(survey_answers: Dict[str, str]) -> Tuple[Optional[int], Optional[str]]:
-    """
-    Каждый раз добавляет новую строку в Google Таблицу (один и тот же пользователь может заполнять опрос многократно).
-    id — уникальный номер записи (увеличивается), в столбце «дата и время заполнения» — момент отправки.
-    Возвращает (id, None) при успехе или (None, сообщение_об_ошибке).
-    """
+_sheet_cache: Dict[str, Any] = {"wks": None, "ts": 0.0, "header_ok": False}
+_SHEET_CACHE_TTL = 300  # 5 минут
+
+def _get_sheet_wks():
+    """Возвращает (worksheet, None) или (None, ошибка). Кешируется на 5 минут."""
+    import time as _time
+    now = _time.time()
+    if _sheet_cache["wks"] is not None and (now - _sheet_cache["ts"]) < _SHEET_CACHE_TTL:
+        return _sheet_cache["wks"], None
+
     sheet_id = os.getenv("GOOGLE_SHEET_ID")
     creds_path = os.getenv("GOOGLE_CREDENTIALS_JSON", "credentials.json")
     if not sheet_id or not sheet_id.strip():
@@ -162,123 +215,271 @@ def _sheet_append_and_get_id(survey_answers: Dict[str, str]) -> Tuple[Optional[i
         from google.oauth2.service_account import Credentials
     except ImportError:
         return None, "Установите: pip install gspread google-auth"
-    fio = (survey_answers.get("q1") or "").strip()
-    birth_year = (survey_answers.get("q2") or "").strip()
-    if not fio:
-        return None, "Нет ФИО (ответ на 1-й вопрос)."
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(sheet_id.strip())
+    wks = sh.sheet1
+    _sheet_cache["wks"] = wks
+    _sheet_cache["ts"] = now
+    _sheet_cache["header_ok"] = False
+    return wks, None
+
+
+def _sheet_start_row(tg_username: str = "", tg_phone: str = "") -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    """
+    Создаёт новую строку (id + дата + telegram + телефон) в начале опроса.
+    Возвращает (row_index_1based, id, None) или (None, None, ошибка).
+    """
     try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(sheet_id.strip())
-        wks = sh.sheet1
+        wks, err = _get_sheet_wks()
+        if wks is None:
+            return None, None, err
         rows = wks.get_all_values()
+
+        expected_header = SHEET_HEADER
         if not rows:
-            wks.append_row(SHEET_HEADER, value_input_option="USER_ENTERED")
-            rows = wks.get_all_values()
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            wks.append_row(expected_header, value_input_option="RAW")
+            rows = [expected_header]
+        elif not _sheet_cache.get("header_ok"):
+            current_header = rows[0][:len(expected_header)]
+            if current_header != expected_header:
+                cell_range = f"A1:{chr(64 + len(expected_header))}1"
+                wks.update(cell_range, [expected_header], value_input_option="RAW")
+            _sheet_cache["header_ok"] = True
+
         new_id = 1
         for i, row in enumerate(rows):
             if i == 0:
                 continue
-            if len(row) >= 1:
+            if row and row[0]:
                 try:
                     existing_id = int(row[0])
                     if existing_id >= new_id:
                         new_id = existing_id + 1
                 except (ValueError, TypeError):
                     pass
-        new_row = [new_id, fio, birth_year, now]
-        for j in range(1, 46):
-            new_row.append(survey_answers.get(f"q{j}", "")[:500])
-        wks.append_row(new_row, value_input_option="USER_ENTERED")
-        return new_id, None
-    except Exception as e:
-        logger.exception("Google Sheet append error: %s", e)
-        return None, str(e)[:200]
 
-
-def _sheet_start_row() -> Tuple[Optional[int], Optional[int], Optional[str]]:
-    """
-    Создаёт новую пустую строку в таблице в начале опроса.
-    Возвращает (row_index_1based, id, None) при успехе или (None, None, сообщение_об_ошибке).
-    """
-    sheet_id = os.getenv("GOOGLE_SHEET_ID")
-    creds_path = os.getenv("GOOGLE_CREDENTIALS_JSON", "credentials.json")
-    if not sheet_id or not sheet_id.strip():
-        return None, None, None
-    creds_path = (creds_path or "").strip()
-    if not creds_path or not os.path.isfile(creds_path):
-        logger.warning("Google credentials file not found: %s", creds_path)
-        return None, None, "Файл учётных данных не найден."
-    try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-    except ImportError:
-        return None, None, "Установите: pip install gspread google-auth"
-    try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(sheet_id.strip())
-        wks = sh.sheet1
-        rows = wks.get_all_values()
-        if not rows:
-            wks.append_row(SHEET_HEADER, value_input_option="USER_ENTERED")
-            rows = wks.get_all_values()
-        new_id = 1
-        for i, row in enumerate(rows):
-            if i == 0:
-                continue
-            if len(row) >= 1:
-                try:
-                    existing_id = int(row[0])
-                    if existing_id >= new_id:
-                        new_id = existing_id + 1
-                except (ValueError, TypeError):
-                    pass
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        new_row = [new_id, "", "", now] + [""] * 45
-        wks.append_row(new_row, value_input_option="USER_ENTERED")
+        new_row = [str(new_id), now, tg_username or "", tg_phone or ""] + [""] * len(MEDICAL_QUESTIONS)
+        wks.append_row(new_row, value_input_option="RAW")
         row_index = len(rows) + 1
         return row_index, new_id, None
     except Exception as e:
+        _sheet_cache["wks"] = None
         logger.exception("Google Sheet start row error: %s", e)
         return None, None, str(e)[:200]
 
 
-def _sheet_update_cell(row_index: int, key: str, value: str) -> Optional[str]:
+def _sheet_update_answer(row_index: int, step: int, value: str) -> Optional[str]:
     """
-    Обновляет одну ячейку в строке row_index (1-based).
-    key — один из: "fio", "birth_year", "дата и время заполнения", "q1".."q45".
-    Возвращает None при успехе или сообщение об ошибке.
+    Записывает ответ на вопрос step (1-based) в строку row_index.
+    Столбец: A=id, B=дата, C=telegram, D=телефон, E=q1(step1), F=q2(step2), …
     """
+    try:
+        wks, err = _get_sheet_wks()
+        if wks is None:
+            return err
+        col = step + 4  # step 1 → col 5 (E), step 2 → col 6 (F), ...
+        cell_value = (value or "")[:500]
+        wks.update_cell(row_index, col, cell_value)
+        return None
+    except Exception as e:
+        _sheet_cache["wks"] = None
+        logger.exception("Google Sheet update cell error: %s", e)
+        return str(e)[:200]
+
+
+# --------------- Лист users (авторизация / регистрация) ---------------
+
+_users_cache: Dict[str, Any] = {"wks": None, "ts": 0.0}
+
+def _get_users_wks():
+    """Возвращает (worksheet 'users', None) или (None, ошибка). Кешируется."""
+    import time as _time
+    now = _time.time()
+    if _users_cache["wks"] is not None and (now - _users_cache["ts"]) < _SHEET_CACHE_TTL:
+        return _users_cache["wks"], None
+
     sheet_id = os.getenv("GOOGLE_SHEET_ID")
     creds_path = os.getenv("GOOGLE_CREDENTIALS_JSON", "credentials.json")
     if not sheet_id or not sheet_id.strip():
-        return None
+        return None, None
     creds_path = (creds_path or "").strip()
     if not creds_path or not os.path.isfile(creds_path):
-        return "Файл учётных данных не найден."
-    if key not in SHEET_HEADER:
-        return None
+        return None, "Файл учётных данных не найден."
     try:
         import gspread
         from google.oauth2.service_account import Credentials
     except ImportError:
-        return "Установите: pip install gspread google-auth"
+        return None, "Установите: pip install gspread google-auth"
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(sheet_id.strip())
     try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(sheet_id.strip())
-        wks = sh.sheet1
-        col_index = SHEET_HEADER.index(key) + 1
-        wks.update_cell(row_index, col_index, (value or "")[:500])
+        wks = sh.worksheet("users")
+    except Exception:
+        wks = sh.add_worksheet(title="users", rows=1000, cols=len(USERS_SHEET_HEADER))
+        wks.append_row(USERS_SHEET_HEADER, value_input_option="RAW")
+    try:
+        wks.freeze(rows=1)
+    except Exception:
+        pass
+    first_row = wks.row_values(1)
+    if first_row != USERS_SHEET_HEADER:
+        wks.update("A1:H1", [USERS_SHEET_HEADER], value_input_option="RAW")
+        wks.freeze(rows=1)
+    _users_cache["wks"] = wks
+    _users_cache["ts"] = now
+    return wks, None
+
+
+def _hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def _find_user_by_email(email: str) -> Optional[Dict[str, str]]:
+    """Ищет пользователя по email. Возвращает dict или None."""
+    try:
+        wks, err = _get_users_wks()
+        if wks is None:
+            return None
+        rows = wks.get_all_values()
+        email_lower = email.strip().lower()
+        for i, row in enumerate(rows):
+            if i == 0:
+                continue
+            if len(row) > 1 and row[1].strip().lower() == email_lower:
+                return {
+                    "row_index": i + 1,
+                    "id": row[0] if len(row) > 0 else "",
+                    "email": row[1] if len(row) > 1 else "",
+                    "password": row[2] if len(row) > 2 else "",
+                    "password_hash": row[3] if len(row) > 3 else "",
+                    "telegram_id": row[4] if len(row) > 4 else "",
+                    "telegram_username": row[5] if len(row) > 5 else "",
+                    "confirmed": row[6] if len(row) > 6 else "",
+                    "created_at": row[7] if len(row) > 7 else "",
+                }
         return None
     except Exception as e:
-        logger.exception("Google Sheet update cell error: %s", e)
+        _users_cache["wks"] = None
+        logger.exception("find_user_by_email error: %s", e)
+        return None
+
+
+def _next_user_id(wks) -> int:
+    """Вычисляет следующий ID пользователя (max существующих + 1)."""
+    try:
+        rows = wks.get_all_values()
+        max_id = 0
+        for i, row in enumerate(rows):
+            if i == 0 or not row:
+                continue
+            try:
+                max_id = max(max_id, int(row[0]))
+            except (ValueError, IndexError):
+                pass
+        return max_id + 1
+    except Exception:
+        return 1
+
+
+def _create_user(email: str, password: str, tg_id: int, tg_username: str) -> Optional[str]:
+    """Создаёт пользователя (confirmed=no). Возвращает None при успехе, иначе текст ошибки."""
+    try:
+        wks, err = _get_users_wks()
+        if wks is None:
+            return err or "Таблица недоступна"
+        existing = _find_user_by_email(email)
+        if existing:
+            return "Пользователь с таким email уже зарегистрирован."
+        new_id = _next_user_id(wks)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        row = [str(new_id), email.strip().lower(), password, _hash_password(password), str(tg_id), tg_username, "no", now]
+        wks.append_row(row, value_input_option="RAW")
+        return None
+    except Exception as e:
+        _users_cache["wks"] = None
+        logger.exception("create_user error: %s", e)
         return str(e)[:200]
+
+
+def _confirm_user(email: str) -> bool:
+    """Ставит confirmed=yes. Возвращает True при успехе."""
+    try:
+        wks, err = _get_users_wks()
+        if wks is None:
+            return False
+        rows = wks.get_all_values()
+        email_lower = email.strip().lower()
+        for i, row in enumerate(rows):
+            if i == 0:
+                continue
+            if len(row) > 1 and row[1].strip().lower() == email_lower:
+                wks.update_cell(i + 1, 7, "yes")
+                return True
+        return False
+    except Exception as e:
+        _users_cache["wks"] = None
+        logger.exception("confirm_user error: %s", e)
+        return False
+
+
+def _check_password(email: str, password: str) -> Optional[Dict[str, str]]:
+    """Проверяет пароль. Возвращает данные пользователя или None."""
+    user = _find_user_by_email(email)
+    if not user:
+        return None
+    if user.get("confirmed", "").lower() != "yes":
+        return None
+    if user.get("password_hash") == _hash_password(password):
+        return user
+    return None
+
+
+def _update_user_tg(email: str, tg_id: int, tg_username: str) -> None:
+    """Обновляет telegram_id и username при авторизации."""
+    try:
+        wks, err = _get_users_wks()
+        if wks is None:
+            return
+        rows = wks.get_all_values()
+        email_lower = email.strip().lower()
+        for i, row in enumerate(rows):
+            if i == 0:
+                continue
+            if len(row) > 1 and row[1].strip().lower() == email_lower:
+                wks.update_cell(i + 1, 5, str(tg_id))
+                wks.update_cell(i + 1, 6, tg_username)
+                return
+    except Exception as e:
+        _users_cache["wks"] = None
+        logger.exception("update_user_tg error: %s", e)
+
+
+def _reset_user_password(email: str) -> Optional[str]:
+    """Сбрасывает пароль: генерирует новый, записывает хеш в таблицу. Возвращает новый пароль или None."""
+    try:
+        wks, err = _get_users_wks()
+        if wks is None:
+            return None
+        rows = wks.get_all_values()
+        email_lower = email.strip().lower()
+        for i, row in enumerate(rows):
+            if i == 0:
+                continue
+            if len(row) > 1 and row[1].strip().lower() == email_lower:
+                new_password = str(random.randint(100000, 999999))
+                wks.update_cell(i + 1, 3, new_password)
+                wks.update_cell(i + 1, 4, _hash_password(new_password))
+                return new_password
+        return None
+    except Exception as e:
+        _users_cache["wks"] = None
+        logger.exception("reset_password error: %s", e)
+        return None
 
 
 # Промпт для одного документа
@@ -311,6 +512,157 @@ MULTI_DOC_PROMPT = """Ты помогаешь пожилым людям разо
 Пиши по-русски, простыми словами. Не пугай, но не скрывай важное. Без лишних деталей — только суть и выводы."""
 
 TEXT_PROMPT = """Ты помогаешь пожилым людям разобраться в вопросах здоровья и медицинских терминах. Отвечай простым русским языком, коротко и по делу. Если спрашивают про анализы или диагнозы — объясни без страшных слов и подскажи, что делать дальше."""
+
+FOLLOWUP_PROMPT = """Ты — врач-консультант высшей категории. Ты уже провёл анализ ситуации пациента.
+
+ДАННЫЕ ПАЦИЕНТА (из опроса):
+{survey_data}
+
+ПРЕДЫДУЩИЙ АНАЛИЗ:
+{previous_analysis}
+
+НОВЫЙ ВОПРОС ПАЦИЕНТА:
+{followup_question}
+
+ЗАДАЧА:
+1. Ответь на вопрос пациента конкретно и по существу, опираясь на данные из предыдущего анализа.
+2. Если пациент спрашивает о враче — укажи конкретную специальность и почему именно к нему.
+3. Если спрашивает об анализах — перечисли конкретные анализы, зачем каждый нужен.
+4. В конце ответа укажи, какие документы ещё помогли бы уточнить картину (если есть такие).
+
+Формат:
+- Сначала прямой ответ на вопрос
+- Затем блок «Для более точного анализа было бы полезно загрузить:» (если применимо)
+
+НИКОГДА не используй LaTeX, $, \\text{}. Числа пиши обычным текстом (126 г/л, 10⁹/л).
+Пиши по-русски, простыми словами, обращаясь на «вы»."""
+
+REQUEST_ANALYSIS_PROMPT = """Ты — опытный врач-диагност высшей категории с 30-летним стажем. Тебе поступил запрос от пациента.
+
+ДАННЫЕ ПАЦИЕНТА (из опроса):
+{survey_data}
+
+ЗАПРОС ПАЦИЕНТА:
+{patient_request}
+{followup_qa}
+
+Твоя задача:
+1. Определи профиль проблемы (кардиология, неврология, терапия, хирургия, эндокринология, и т.д.).
+2. На основании запроса и данных пациента, определи, какие документы НЕОБХОДИМЫ для полноценного анализа.
+
+Ответь КРАТКО и СТРУКТУРИРОВАННО. Пиши по-русски, простыми словами, обращаясь к пациенту на «вы».
+
+Формат ответа:
+1) Одно предложение о том, что вы поняли из запроса.
+2) Список документов, которые нужно загрузить (только из этого списка, выбери нужные):
+- Анализы (кровь, моча, биохимия и др.)
+- Выписной эпикриз
+- Консультативное заключение врача
+- Назначения и рецепты
+- Протокол СМП (скорой помощи)
+- История болезни / амбулаторная карта
+- Результаты обследований (УЗИ, КТ, МРТ, ЭКГ, рентген)
+
+Не пиши лишнего. Не ставь диагноз. Не пугай."""
+
+# Уточняющие вопросы после описания ситуации (1–5 вопросов для более точного анализа)
+CLARIFY_QUESTIONS_PROMPT = """Ты — опытный врач-диагност. Пациент описал свою ситуацию. Твоя задача — сформулировать от 1 до 5 самых важных уточняющих вопросов, ответы на которые помогут точнее понять случай и дать более правильные рекомендации.
+
+ДАННЫЕ ПАЦИЕНТА (из опроса):
+{survey_data}
+
+ОПИСАНИЕ СИТУАЦИИ ОТ ПАЦИЕНТА:
+{patient_request}
+
+Требования к вопросам:
+- Вопросы должны быть конкретными, краткими и по делу (симптомы, сроки, обстоятельства, уже сделанные обследования, приём лекарств и т.д.).
+- Не задавай более 5 вопросов. Если достаточно 1–2 — задай 1–2.
+- Формат ответа: строго по одному вопросу на строку, без нумерации и без лишнего текста. Пример:
+Когда именно появилась боль?
+Принимаете ли вы обезболивающие и какие?
+- Не пиши вводных фраз типа «Вопросы:» — только сами вопросы, каждый с новой строки.
+- Пиши по-русски, на «вы»."""
+
+# Уточняющие вопросы после анализа документов (1–5 вопросов для уточнения заключения)
+POST_DOC_QUESTIONS_PROMPT = """Ты — врач-диагност. По документам пациента уже проведён первичный анализ. Чтобы уточнить заключение и рекомендации, нужно задать пациенту от 1 до 5 коротких уточняющих вопросов.
+
+ЗАПРОС ПАЦИЕНТА:
+{patient_request}
+
+ПЕРВИЧНЫЙ АНАЛИЗ (кратко):
+{analysis_summary}
+
+Сформулируй от 1 до 5 самых важных вопросов, на которые нужны ответы пациента (например: текущие симптомы, приём лекарств, дата последнего обследования, аллергии, что уже пробовал и т.д.). Вопросы должны быть краткими и конкретными.
+
+Формат ответа: строго по одному вопросу на строку, без нумерации. Не пиши вводных фраз — только вопросы, каждый с новой строки. По-русски, на «вы»."""
+
+# Уточнение заключения с учётом ответов пациента на уточняющие вопросы
+REFINED_ANALYSIS_PROMPT = """Ты — врач-диагност. У тебя есть первичный анализ по документам пациента и ответы пациента на уточняющие вопросы. Дай итоговое заключение и рекомендации с учётом этой дополнительной информации.
+
+ПЕРВИЧНЫЙ АНАЛИЗ:
+{full_analysis}
+
+УТОЧНЯЮЩИЕ ВОПРОСЫ И ОТВЕТЫ ПАЦИЕНТА:
+{qa_block}
+
+ЗАДАЧА: сохрани структуру первичного анализа (резюме, клиническая интерпретация, диагноз, что значит для пациента, действия врачей, план действий), но дополни и скорректируй разделы с учётом ответов пациента. Если ответы меняют выводы или рекомендации — укажи это явно. Пиши по-русски. Не используй LaTeX. Будь конкретен."""
+
+FULL_ANALYSIS_PROMPT = """Ты — врач-диагност высшей категории, профильный специалист. Проведи ПОЛНЫЙ анализ ситуации пациента.
+
+ДАННЫЕ ПАЦИЕНТА (из опроса):
+{survey_data}
+
+ЗАПРОС ПАЦИЕНТА:
+{patient_request}
+
+К сообщению приложены медицинские документы пациента (изображения). Внимательно изучи ВСЕ документы.
+
+ЗАДАЧА — дай развёрнутое заключение СТРОГО по следующей структуре (8 блоков):
+
+### ПРОФЕССИОНАЛЬНЫЙ БЛОК
+
+**1. РЕЗЮМЕ СЛУЧАЯ**
+Краткое описание: кто пациент, что произошло, хронология событий. ВСЕ цифры из документов: показатели, даты, значения анализов, дозировки. Указывай конкретные числа.
+
+**2. КЛИНИЧЕСКАЯ ИНТЕРПРЕТАЦИЯ**
+По каждому показателю из документов укажи:
+- Значение пациента → норма → отклонение (например: «Гемоглобин 98 г/л при норме 120–160 г/л — снижен на 18%»)
+- Что это значит клинически
+- Связи между показателями из разных документов
+Группируй по системам: кровь, биохимия, инструментальные и т.д.
+
+**3. ДИАГНОЗ**
+Основной диагноз (или предполагаемый) с обоснованием — какие конкретные цифры и данные его подтверждают.
+
+**4. ДИФФЕРЕНЦИАЛЬНЫЙ ДИАГНОЗ**
+Какие ещё диагнозы возможны. По каждому: что подтверждает (с цифрами), что опровергает.
+
+### ПАЦИЕНТСКИЙ БЛОК (простыми словами)
+
+**5. ЧТО ЭТО ЗНАЧИТ ДЛЯ ВАС**
+Объясни всё максимально просто, как пожилому человеку. Используй сравнения и аналогии. Для каждого важного показателя объясни: «Ваш показатель X = такое-то число. Нормальное значение — такое-то. Это означает...». Коротко: что произошло, насколько это серьёзно, к чему быть готовым.
+
+**СРОЧНОСТЬ:** требует экстренной помощи / нужна плановая консультация / можно наблюдать.
+
+### ЧТО СДЕЛАЛИ ВРАЧИ
+
+**6. ДЕЙСТВИЯ ВРАЧЕЙ — ЧТО БЫЛО СДЕЛАНО**
+Перечисли конкретно, что врачи уже сделали по данным из документов: обследования, назначения, процедуры, консультации. С датами и цифрами.
+
+**7. ЧТО ВРАЧИ НЕ СДЕЛАЛИ — О ЧЁМ НУЖНО СПРОСИТЬ**
+Перечисли, что по стандартам лечения должно было быть сделано, но НЕ отражено в документах. По каждому пункту дай:
+- Что не сделано
+- Почему это важно
+- Как спросить врача (конкретная фраза, которую можно произнести на приёме, вежливо но настойчиво)
+
+### ПЛАН ДЕЙСТВИЙ
+
+**8. ЧТО ДЕЛАТЬ**
+- Что нужно сделать в первую очередь (конкретные шаги, пронумерованные)
+- Какие дополнительные обследования пройти
+- Чего точно НЕ делать
+
+Пиши по-русски. НИКОГДА не используй LaTeX, формулы, знаки $ или \\text{}. Числа и единицы пиши обычным текстом (например: 126 г/л, 7,76×10⁹/л, 15 мм/час, менее 0,14 г/л). Для степеней используй символы ⁰¹²³⁴⁵⁶⁷⁸⁹ (например: 10⁹). В профессиональном блоке используй медицинскую терминологию с цифрами. В пациентском блоке — максимально простым языком с конкретными цифрами и их расшифровкой. Не пугай, но не скрывай важное. Будь конкретен — никаких общих фраз."""
 
 # Ключи в user_data для буфера фото
 PENDING_IMAGES_KEY = "pending_images"
@@ -361,22 +713,51 @@ def _escape_html(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _strip_latex(text: str) -> str:
+    """Убирает LaTeX-разметку: $...$, \text{}, \times и т.д."""
+    text = re.sub(r"\$([^$]*)\$", r"\1", text)
+    text = re.sub(r"\\text\{([^}]*)\}", r"\1", text)
+    text = text.replace("\\times", "×")
+    text = text.replace("\\cdot", "·")
+    text = text.replace("\\leq", "≤").replace("\\geq", "≥")
+    text = text.replace("\\lt", "<").replace("\\gt", ">")
+    text = text.replace("\\le", "≤").replace("\\ge", "≥")
+    text = re.sub(r"\^(\d)", lambda m: "⁰¹²³⁴⁵⁶⁷⁸⁹"[int(m.group(1))], text)
+    text = re.sub(r"\^\{(\d+)\}", lambda m: "".join("⁰¹²³⁴⁵⁶⁷⁸⁹"[int(d)] for d in m.group(1)), text)
+    text = re.sub(r"\\[a-zA-Z]+", "", text)
+    return text
+
+
 def _format_conclusion_for_elderly(raw: str) -> str:
     """Форматирует заключение для удобного чтения: заголовки, эмодзи, жирный текст, разбивка."""
     if not raw or len(raw) > 4000:
         raw = (raw or "")[:4000]
+    raw = _strip_latex(raw)
     raw = _escape_html(raw)
-    # Markdown **текст** → HTML <b>текст</b> (для пожилых — лучше читается)
     raw = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", raw)
-    # Заголовки абзацев — жирным и с эмодзи
-    raw = raw.replace("АБЗАЦ 1 —", "\n\n<b>📋 Что произошло и что это значит</b>\n\n")
-    raw = raw.replace("АБЗАЦ 2 —", "\n\n<b>💊 Рекомендации: что делать и чего не делать</b>\n\n")
-    # Строки вида ### 4. Заключение или #### Подзаголовок — делаем жирными
+
+    section_icons = {
+        "ПРОФЕССИОНАЛЬНЫЙ БЛОК": "🏥",
+        "РЕЗЮМЕ СЛУЧАЯ": "📋",
+        "КЛИНИЧЕСКАЯ ИНТЕРПРЕТАЦИЯ": "🔬",
+        "ДИАГНОЗ": "🩺",
+        "ДИФФЕРЕНЦИАЛЬНЫЙ ДИАГНОЗ": "🔍",
+        "ПАЦИЕНТСКИЙ БЛОК": "💬",
+        "ЧТО ЭТО ЗНАЧИТ ДЛЯ ВАС": "💡",
+        "СРОЧНОСТЬ": "🚨",
+        "ЧТО СДЕЛАЛИ ВРАЧИ": "👨‍⚕️",
+        "ДЕЙСТВИЯ ВРАЧЕЙ — ЧТО БЫЛО СДЕЛАНО": "✅",
+        "ЧТО ВРАЧИ НЕ СДЕЛАЛИ — О ЧЁМ НУЖНО СПРОСИТЬ": "⚠️",
+        "ПЛАН ДЕЙСТВИЙ": "📝",
+        "ЧТО ДЕЛАТЬ": "🎯",
+    }
+    for title, icon in section_icons.items():
+        raw = raw.replace(title, f"\n\n{icon} <b>{title}</b>\n")
+
     raw = re.sub(r"(?m)^#+\s*(.+)$", r"\n<b>\1</b>\n", raw)
-    # Нумерованные пункты 1) 2) 3) — с эмодзи для наглядности
+    raw = re.sub(r"(?m)^(\d+)\.\s+", r"\n\1️⃣ ", raw)
     raw = re.sub(r"(\d+)\)\s*", r"\n\1️⃣ ", raw)
-    raw = re.sub(r"^(\d+)\s*\)", r"\1️⃣", raw, flags=re.MULTILINE)
-    # Убираем оставшиеся # в начале строк
+    raw = re.sub(r"(?m)^-\s+", "  • ", raw)
     raw = re.sub(r"(?m)^#+\s*", "", raw)
     raw = re.sub(r"\n{3,}", "\n\n", raw)
     raw = raw.strip()
@@ -499,6 +880,105 @@ async def _ask_groq_image(image_b64: str, mime: str = "image/jpeg") -> str:
         max_tokens=1500,
     )
     return (response.choices[0].message.content or "").strip()
+
+
+def _format_survey_data(answers: dict) -> str:
+    """Форматирует ответы опроса в читаемый текст для промпта ИИ."""
+    if not answers:
+        return "Нет данных опроса."
+    lines = []
+    for i, (q_tuple) in enumerate(MEDICAL_QUESTIONS):
+        q_text = q_tuple[0]
+        val = answers.get(f"q{i+1}", "").strip()
+        if val:
+            lines.append(f"- {q_text}: {val}")
+    return "\n".join(lines) if lines else "Нет данных опроса."
+
+
+def _parse_questions_from_ai(response: str) -> List[str]:
+    """Из ответа ИИ извлекает список вопросов (до 5). Убирает нумерацию."""
+    if not response or not response.strip():
+        return []
+    lines = [line.strip() for line in response.strip().splitlines() if line.strip()]
+    cleaned: List[str] = []
+    for line in lines:
+        s = re.sub(r"^\s*\d+[\.\)]\s*", "", line).strip()
+        if s and len(s) > 3:
+            cleaned.append(s)
+    return cleaned[:5]
+
+
+async def _ask_ai_text(system_prompt: str, user_text: str) -> str:
+    """Универсальный запрос к текстовому ИИ (Groq, затем OpenAI)."""
+    text = ""
+    client = get_groq_client()
+    if client:
+        try:
+            resp = client.chat.completions.create(
+                model=GROQ_TEXT_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                max_tokens=2000,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            logger.warning("Groq text: %s", e)
+    if not text:
+        client = get_openai_client()
+        if client:
+            try:
+                resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_text},
+                    ],
+                    max_tokens=2000,
+                )
+                text = (resp.choices[0].message.content or "").strip()
+            except Exception as e:
+                logger.warning("OpenAI text: %s", e)
+    return text
+
+
+async def _ask_ai_with_images(system_prompt: str, user_text: str, images: list) -> str:
+    """Запрос к ИИ с текстом и изображениями (Groq, затем OpenAI)."""
+    content = [{"type": "text", "text": user_text}]
+    for b64, mime in images:
+        content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+    text = ""
+    client = get_groq_client()
+    if client:
+        try:
+            resp = client.chat.completions.create(
+                model=GROQ_VISION_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content},
+                ],
+                max_tokens=3000,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            logger.warning("Groq vision: %s", e)
+    if not text:
+        client = get_openai_client()
+        if client:
+            try:
+                resp = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": content},
+                    ],
+                    max_tokens=3000,
+                )
+                text = (resp.choices[0].message.content or "").strip()
+            except Exception as e:
+                logger.warning("OpenAI vision: %s", e)
+    return text
 
 
 async def _ask_groq_text(user_text: str) -> str:
@@ -657,6 +1137,10 @@ async def _job_process_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in list(context.user_data.keys()):
+        if key.startswith("awaiting_"):
+            context.user_data.pop(key, None)
+
     welcome = (
         "<b>Привет!</b> 👋\n\n"
         "Я — помощник по медицинским документам. Разбираю анализы и заключения врачей простыми словами, "
@@ -666,15 +1150,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "2️⃣ Подсказываю, что в норме, а на что обратить внимание\n"
         "3️⃣ Даю понятные рекомендации: к врачу ли идти и о чём спросить\n"
         "4️⃣ Отвечаю на вопросы о здоровье простым языком\n\n"
-        "<b>Что можно сделать:</b>\n"
-        "• Пройти короткий опрос о здоровье\n"
-        "• Прислать фото анализов или заключений — разберу по пунктам\n"
-        "• Написать вопрос текстом — отвечу простым языком\n\n"
-        "Нажмите кнопку ниже, чтобы начать."
+        "Для начала войдите в свой аккаунт или зарегистрируйтесь."
     )
+    auth_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔑 Авторизоваться", callback_data=CB_AUTH_LOGIN)],
+        [InlineKeyboardButton("📝 Зарегистрироваться", callback_data=CB_AUTH_REGISTER)],
+    ])
     await update.message.reply_text(
         welcome,
-        reply_markup=_start_button_keyboard(),
+        reply_markup=auth_kb,
         parse_mode="HTML",
     )
 
@@ -749,6 +1233,15 @@ def _schedule_pending_job(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> N
     _pending_tasks[user_id] = asyncio.create_task(_delayed_batch(context.application, user_id))
 
 
+def _add_to_pending(user_id: int, chat_id: int, file_id: str, mime: str) -> int:
+    """Добавляет файл в буфер _pending, возвращает кол-во файлов."""
+    if user_id not in _pending:
+        _pending[user_id] = {"chat_id": chat_id, "file_ids": []}
+    _pending[user_id]["chat_id"] = chat_id
+    _pending[user_id]["file_ids"].append((file_id, mime))
+    return len(_pending[user_id]["file_ids"])
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     has_groq = _use_groq()
     has_openai = bool(get_openai_client())
@@ -759,24 +1252,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     photo = update.message.photo[-1]
-    file_id = photo.file_id
-    mime = "image/jpeg"
+    n = _add_to_pending(user_id, chat_id, photo.file_id, "image/jpeg")
 
-    if user_id not in _pending:
-        _pending[user_id] = {"chat_id": chat_id, "file_ids": []}
-    _pending[user_id]["chat_id"] = chat_id
-    _pending[user_id]["file_ids"].append((file_id, mime))
-    n = len(_pending[user_id]["file_ids"])
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📎 Отправить документы на анализ", callback_data=CB_SEND_DOCS)],
+    ])
+    if context.user_data.get("collecting_docs"):
+        await update.message.reply_text(
+            f"✅ Документ принят ({n}). Загрузите ещё или нажмите кнопку ниже.",
+            reply_markup=keyboard,
+        )
+        return
 
     _schedule_pending_job(context, user_id)
-    msg = (
-        f"Получил ({n} документ(ов)). Пришли ещё в течение {BATCH_DELAY_SEC} сек — разберу всё вместе. "
-        f"Или напиши «всё» / «готово».\n\nВыберите ИИ для анализа:"
-    )
-    keyboard = _ai_choice_keyboard()
     await update.message.reply_text(
-        msg,
-        reply_markup=keyboard if keyboard else MAIN_KEYBOARD,
+        f"✅ Получил ({n}). Загрузите все документы и нажмите кнопку для анализа.",
+        reply_markup=keyboard,
     )
 
 
@@ -800,21 +1291,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if mime not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
         mime = "image/jpeg"
 
-    if user_id not in _pending:
-        _pending[user_id] = {"chat_id": chat_id, "file_ids": []}
-    _pending[user_id]["chat_id"] = chat_id
-    _pending[user_id]["file_ids"].append((doc.file_id, mime))
-    n = len(_pending[user_id]["file_ids"])
+    n = _add_to_pending(user_id, chat_id, doc.file_id, mime)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📎 Отправить документы на анализ", callback_data=CB_SEND_DOCS)],
+    ])
+    if context.user_data.get("collecting_docs"):
+        await update.message.reply_text(
+            f"✅ Документ принят ({n}). Загрузите ещё или нажмите кнопку ниже.",
+            reply_markup=keyboard,
+        )
+        return
 
     _schedule_pending_job(context, user_id)
-    msg = (
-        f"Получил ({n} документ(ов)). Пришли ещё в течение {BATCH_DELAY_SEC} сек — разберу всё вместе. "
-        f"Или напиши «всё» / «готово».\n\nВыберите ИИ для анализа:"
-    )
-    keyboard = _ai_choice_keyboard()
     await update.message.reply_text(
-        msg,
-        reply_markup=keyboard if keyboard else MAIN_KEYBOARD,
+        f"✅ Получил ({n}). Загрузите все документы и нажмите кнопку для анализа.",
+        reply_markup=keyboard,
     )
 
 
@@ -852,13 +1344,134 @@ async def handle_ai_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 def _format_medical_question(step: int, total: int) -> str:
-    """Текст вопроса опросника с вариантами (если есть)."""
+    """Текст вопроса опросника."""
     q, variants = MEDICAL_QUESTIONS[step - 1]
     line = f"<b>Вопрос {step} из {total}</b>\n\n{q}"
     if variants:
-        line += f"\n\n({variants})"
-    line += "\n\nНапишите ответ в чат и нажмите Enter."
+        line += "\n\nВыберите вариант кнопкой или напишите свой."
+    else:
+        line += "\n\nНапишите ответ в чат и нажмите Enter."
     return line
+
+
+def _survey_done_message(user_id_sheet) -> str:
+    """Сообщение после завершения опроса с ID — просим описать запрос."""
+    id_line = ""
+    if user_id_sheet is not None:
+        id_line = f"\n\nВаш уникальный <b>ID: {user_id_sheet}</b>. Сохраните его — он привязан к вашей карте."
+    return (
+        f"Спасибо за ваши ответы! Они помогут провести более точный анализ.{id_line}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Теперь, пожалуйста, расскажите подробно о вашей ситуации:\n\n"
+        "  — Что произошло? Что вас беспокоит?\n"
+        "  — В связи с чем вы решили обратиться?\n"
+        "  — Если у вас есть медицинские документы — расскажите, при каких обстоятельствах и по какой причине они были получены.\n\n"
+        "Чем подробнее вы опишете ситуацию — симптомы, хронологию событий, "
+        "обстоятельства — тем точнее и глубже я смогу провести анализ "
+        "и дать полезные рекомендации.\n\n"
+        "Напишите текстом или запишите голосовое сообщение."
+    )
+
+
+def _survey_question_keyboard(step: int) -> InlineKeyboardMarkup:
+    """Инлайн-кнопки для вопроса: варианты ответа (если есть) + Пропустить."""
+    _, variants = MEDICAL_QUESTIONS[step - 1]
+    buttons: list[list[InlineKeyboardButton]] = []
+    if variants:
+        for i, v in enumerate(variants.split(" / ")):
+            buttons.append([InlineKeyboardButton(v.strip(), callback_data=f"survey:ans:{i}")])
+    buttons.append([InlineKeyboardButton("Пропустить", callback_data="survey:skip")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def _send_survey_question(
+    bot, chat_id: int, step: int, total: int, *, remove_reply_kb: bool = False
+) -> "telegram.Message":
+    """Отправляет вопрос опросника с инлайн-кнопками. При remove_reply_kb убирает обычную клавиатуру."""
+    q_text = _format_medical_question(step, total)
+    kb = _survey_question_keyboard(step)
+    if remove_reply_kb:
+        sent = await bot.send_message(chat_id, q_text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+        try:
+            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=sent.message_id, reply_markup=kb)
+        except Exception:
+            pass
+    else:
+        sent = await bot.send_message(chat_id, q_text, parse_mode="HTML", reply_markup=kb)
+    return sent
+
+
+async def handle_auth_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки 'Авторизоваться' / 'Зарегистрироваться' после /start."""
+    query = update.callback_query
+    await query.answer()
+    data = (query.data or "").strip()
+    chat_id = query.message.chat_id
+    bot = context.bot
+
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    for key in list(context.user_data.keys()):
+        if key.startswith("awaiting_"):
+            context.user_data.pop(key, None)
+
+    if data == CB_AUTH_LOGIN:
+        context.user_data["awaiting_login_email"] = True
+        await bot.send_message(
+            chat_id,
+            "Введите ваш <b>email</b> (логин):",
+            parse_mode="HTML",
+            reply_markup=MAIN_KEYBOARD,
+        )
+    elif data == CB_AUTH_REGISTER:
+        context.user_data["awaiting_reg_email"] = True
+        await bot.send_message(
+            chat_id,
+            "Введите ваш <b>email</b> для регистрации:",
+            parse_mode="HTML",
+            reply_markup=MAIN_KEYBOARD,
+        )
+    elif data == CB_FORGOT_PASSWORD:
+        saved_email = context.user_data.get("login_email", "").strip()
+        if saved_email and "@" in saved_email:
+            await bot.send_message(chat_id, "Сбрасываю пароль…", reply_markup=MAIN_KEYBOARD)
+            new_pw = await asyncio.to_thread(_reset_user_password, saved_email)
+            if new_pw:
+                login_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔑 Авторизоваться", callback_data=CB_AUTH_LOGIN)],
+                ])
+                await bot.send_message(
+                    chat_id,
+                    f"Новый пароль для <b>{_escape_html(saved_email)}</b>:\n\n"
+                    f"<code>{new_pw}</code>\n\n"
+                    "Запомните или сохраните его. Нажмите кнопку ниже, чтобы войти.",
+                    parse_mode="HTML",
+                    reply_markup=login_kb,
+                )
+            else:
+                retry_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔑 Авторизоваться", callback_data=CB_AUTH_LOGIN)],
+                    [InlineKeyboardButton("📝 Зарегистрироваться", callback_data=CB_AUTH_REGISTER)],
+                ])
+                await bot.send_message(
+                    chat_id,
+                    "Пользователь с таким email не найден.\n\n"
+                    "Проверьте email или зарегистрируйтесь.",
+                    parse_mode="HTML",
+                    reply_markup=retry_kb,
+                )
+        else:
+            context.user_data["awaiting_reset_email"] = True
+            await bot.send_message(
+                chat_id,
+                "Введите <b>email</b>, указанный при регистрации.\n"
+                "Мы отправим на него новый пароль.",
+                parse_mode="HTML",
+                reply_markup=MAIN_KEYBOARD,
+            )
 
 
 async def handle_flow_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -906,7 +1519,9 @@ async def handle_consent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         pass
     context.user_data["survey_step"] = 1
     context.user_data["survey_answers"] = {}
-    sheet_row, sheet_id, _ = await asyncio.to_thread(_sheet_start_row)
+    user = update.effective_user
+    tg_username = f"@{user.username}" if user and user.username else (user.full_name if user else "")
+    sheet_row, sheet_id, _ = await asyncio.to_thread(_sheet_start_row, tg_username, "")
     if sheet_row is not None and sheet_id is not None:
         context.user_data["survey_sheet_row"] = sheet_row
         context.user_data["survey_sheet_id"] = sheet_id
@@ -914,10 +1529,7 @@ async def handle_consent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.pop("survey_sheet_row", None)
         context.user_data.pop("survey_sheet_id", None)
     total_q = len(MEDICAL_QUESTIONS)
-    q_text = _format_medical_question(1, total_q)
-    sent = await bot.send_message(
-        chat_id, q_text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove()
-    )
+    sent = await _send_survey_question(bot, chat_id, 1, total_q, remove_reply_kb=True)
     context.user_data["survey_question_message_id"] = sent.message_id
 
 
@@ -929,7 +1541,9 @@ async def handle_next_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data == CB_NEXT_SURVEY:
         context.user_data["survey_step"] = 1
         context.user_data["survey_answers"] = {}
-        sheet_row, sheet_id, _ = await asyncio.to_thread(_sheet_start_row)
+        user = update.effective_user
+        tg_username = f"@{user.username}" if user and user.username else (user.full_name if user else "")
+        sheet_row, sheet_id, _ = await asyncio.to_thread(_sheet_start_row, tg_username, "")
         if sheet_row is not None and sheet_id is not None:
             context.user_data["survey_sheet_row"] = sheet_row
             context.user_data["survey_sheet_id"] = sheet_id
@@ -937,15 +1551,12 @@ async def handle_next_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data.pop("survey_sheet_row", None)
             context.user_data.pop("survey_sheet_id", None)
         total = len(MEDICAL_QUESTIONS)
-        q_text = _format_medical_question(1, total)
         chat_id = query.message.chat_id
         try:
             await query.message.delete()
         except Exception:
             pass
-        sent = await context.bot.send_message(
-            chat_id, q_text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove()
-        )
+        sent = await _send_survey_question(context.bot, chat_id, 1, total, remove_reply_kb=True)
         context.user_data["survey_question_message_id"] = sent.message_id
     elif data == CB_NEXT_UPLOAD:
         upload_text = (
@@ -958,56 +1569,245 @@ async def handle_next_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.message.reply_text(upload_text, reply_markup=MAIN_KEYBOARD)
 
 
-async def handle_survey_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка «Отправить ответ» — удаляем предыдущий вопрос, отправляем следующий (кнопка всегда под актуальным вопросом)."""
+async def handle_survey_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка инлайн-кнопок опросника: выбор варианта (survey:ans:N), пропуск (survey:skip)."""
     query = update.callback_query
+    data = (query.data or "").strip()
     step = context.user_data.get("survey_step", 0)
-    answers = context.user_data.get("survey_answers") or {}
-    key = f"q{step}"
-    if not answers.get(key):
-        await query.answer("Сначала напишите ответ в чат и отправьте сообщение.", show_alert=True)
+    if not step or step < 1 or step > len(MEDICAL_QUESTIONS):
+        await query.answer()
         return
+
+    if data == "survey:skip":
+        answer_val = ""
+    elif data.startswith("survey:ans:"):
+        try:
+            idx = int(data.split(":")[-1])
+        except (ValueError, IndexError):
+            await query.answer()
+            return
+        _, variants = MEDICAL_QUESTIONS[step - 1]
+        if variants:
+            opts = [v.strip() for v in variants.split(" / ")]
+            answer_val = opts[idx] if idx < len(opts) else ""
+        else:
+            answer_val = ""
+    else:
+        await query.answer()
+        return
+
     await query.answer()
+    if "survey_answers" not in context.user_data:
+        context.user_data["survey_answers"] = {}
+    context.user_data["survey_answers"][f"q{step}"] = answer_val
+
+    sheet_row = context.user_data.get("survey_sheet_row")
+    if sheet_row is not None:
+        await asyncio.to_thread(_sheet_update_answer, sheet_row, step, answer_val)
+
     chat_id = query.message.chat_id
     bot = context.bot
-    # Удаляем сообщение с предыдущим вопросом — в чате оно исчезает (в части клиентов с анимацией)
     try:
         await query.message.delete()
     except Exception:
         pass
+
     next_step = step + 1
     total = len(MEDICAL_QUESTIONS)
     if next_step <= total:
         context.user_data["survey_step"] = next_step
-        q_text = _format_medical_question(next_step, total)
-        sent = await bot.send_message(
-            chat_id,
-            q_text,
-            parse_mode="HTML",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        sent = await _send_survey_question(bot, chat_id, next_step, total)
         context.user_data["survey_question_message_id"] = sent.message_id
     else:
-        context.user_data.pop("survey_answers", None)
         user_id_sheet = context.user_data.pop("survey_sheet_id", None)
+        saved_answers = dict(context.user_data.get("survey_answers") or {})
         context.user_data.pop("survey_step", None)
+        context.user_data.pop("survey_answers", None)
         context.user_data.pop("survey_question_message_id", None)
         context.user_data.pop("survey_sheet_row", None)
-        done_text = "Спасибо! Опрос завершён. Теперь можно присылать анализы и документы — учту ваши ответы при разборе."
-        await bot.send_message(chat_id, done_text, reply_markup=MAIN_KEYBOARD)
-        if user_id_sheet is not None:
-            await bot.send_message(
-                chat_id,
-                f"<b>Ваш уникальный ID:</b> {user_id_sheet}\n\nСохраните его — он привязан к ФИО и дате рождения.",
-                parse_mode="HTML",
-                reply_markup=MAIN_KEYBOARD,
-            )
+        context.user_data["completed_survey_answers"] = saved_answers
+        context.user_data["awaiting_request"] = True
+        await bot.send_message(
+            chat_id,
+            _survey_done_message(user_id_sheet),
+            parse_mode="HTML",
+            reply_markup=MAIN_KEYBOARD,
+        )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user_text = (update.message.text or "").strip()
     if not user_text:
+        return
+
+    # ---- Сброс пароля: ввод email ----
+    if context.user_data.get("awaiting_reset_email"):
+        context.user_data["awaiting_reset_email"] = False
+        email = user_text.strip().lower()
+        if "@" not in email or "." not in email:
+            context.user_data["awaiting_reset_email"] = True
+            await update.message.reply_text("Некорректный email. Попробуйте ещё раз:")
+            return
+        await update.message.reply_text("Проверяю...")
+        new_pw = await asyncio.to_thread(_reset_user_password, email)
+        if new_pw:
+            login_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 Авторизоваться", callback_data=CB_AUTH_LOGIN)],
+            ])
+            await update.message.reply_text(
+                f"Новый пароль для <b>{_escape_html(email)}</b>:\n\n"
+                f"<code>{new_pw}</code>\n\n"
+                "Запомните или сохраните его. Нажмите кнопку ниже, чтобы войти.",
+                parse_mode="HTML",
+                reply_markup=login_kb,
+            )
+        else:
+            retry_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 Авторизоваться", callback_data=CB_AUTH_LOGIN)],
+                [InlineKeyboardButton("📝 Зарегистрироваться", callback_data=CB_AUTH_REGISTER)],
+            ])
+            await update.message.reply_text(
+                "Пользователь с таким email не найден.\n\n"
+                "Проверьте email или зарегистрируйтесь.",
+                parse_mode="HTML",
+                reply_markup=retry_kb,
+            )
+        return
+
+    # ---- Авторизация: ввод email ----
+    if context.user_data.get("awaiting_login_email"):
+        context.user_data["awaiting_login_email"] = False
+        context.user_data["login_email"] = user_text.strip().lower()
+        context.user_data["awaiting_login_password"] = True
+        forgot_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Забыли пароль?", callback_data=CB_FORGOT_PASSWORD)],
+        ])
+        await update.message.reply_text(
+            "Введите <b>пароль</b>:",
+            parse_mode="HTML",
+            reply_markup=forgot_kb,
+        )
+        return
+
+    # ---- Авторизация: ввод пароля ----
+    if context.user_data.get("awaiting_login_password"):
+        context.user_data["awaiting_login_password"] = False
+        email = context.user_data.pop("login_email", "")
+        password = user_text.strip()
+
+        await update.message.reply_text("Проверяю…")
+        user_rec = await asyncio.to_thread(_check_password, email, password)
+        if user_rec:
+            tg_user = update.effective_user
+            tg_username = f"@{tg_user.username}" if tg_user and tg_user.username else (tg_user.full_name if tg_user else "")
+            await asyncio.to_thread(_update_user_tg, email, user_id, tg_username)
+            context.user_data["authenticated"] = True
+            context.user_data["auth_email"] = email
+            context.user_data["collecting_docs"] = True
+            context.user_data["awaiting_request"] = True
+            await update.message.reply_text(
+                f"Добро пожаловать, <b>{_escape_html(email)}</b>! 👋\n\n"
+                "Расскажите, что случилось? Что вас беспокоит?\n\n"
+                "Напишите текстом, запишите голосовое или загрузите медицинские документы.",
+                parse_mode="HTML",
+                reply_markup=MAIN_KEYBOARD,
+            )
+        else:
+            retry_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 Авторизоваться", callback_data=CB_AUTH_LOGIN)],
+                [InlineKeyboardButton("🔄 Забыли пароль?", callback_data=CB_FORGOT_PASSWORD)],
+            ])
+            await update.message.reply_text(
+                "Неверный email или пароль, либо аккаунт не подтверждён.\n\n"
+                "Выберите действие:",
+                parse_mode="HTML",
+                reply_markup=retry_kb,
+            )
+        return
+
+    # ---- Регистрация: ввод email ----
+    if context.user_data.get("awaiting_reg_email"):
+        context.user_data["awaiting_reg_email"] = False
+        email = user_text.strip().lower()
+        if "@" not in email or "." not in email:
+            context.user_data["awaiting_reg_email"] = True
+            await update.message.reply_text("Некорректный email. Попробуйте ещё раз:")
+            return
+        existing = await asyncio.to_thread(_find_user_by_email, email)
+        if existing:
+            exists_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 Авторизоваться", callback_data=CB_AUTH_LOGIN)],
+                [InlineKeyboardButton("🔄 Забыли пароль?", callback_data=CB_FORGOT_PASSWORD)],
+                [InlineKeyboardButton("👤 Новый пользователь", callback_data=CB_AUTH_REGISTER)],
+            ])
+            await update.message.reply_text(
+                "Пользователь с таким email уже зарегистрирован.\n\n"
+                "Выберите действие:",
+                reply_markup=exists_kb,
+            )
+            return
+        context.user_data["reg_email"] = email
+        context.user_data["awaiting_reg_password"] = True
+        await update.message.reply_text("Придумайте <b>пароль</b> (минимум 4 символа):", parse_mode="HTML")
+        return
+
+    # ---- Регистрация: ввод пароля ----
+    if context.user_data.get("awaiting_reg_password"):
+        context.user_data["awaiting_reg_password"] = False
+        password = user_text.strip()
+        if len(password) < 4:
+            context.user_data["awaiting_reg_password"] = True
+            await update.message.reply_text("Пароль слишком короткий. Минимум 4 символа. Попробуйте ещё раз:")
+            return
+        email = context.user_data.get("reg_email", "")
+        tg_user = update.effective_user
+        tg_username = f"@{tg_user.username}" if tg_user and tg_user.username else (tg_user.full_name if tg_user else "")
+
+        err = await asyncio.to_thread(_create_user, email, password, user_id, tg_username)
+        if err:
+            await update.message.reply_text(f"Ошибка регистрации: {err}\nПопробуйте /start заново.")
+            return
+
+        code = str(random.randint(100000, 999999))
+        context.user_data["confirm_code"] = code
+        context.user_data["confirm_email"] = email
+        context.user_data["awaiting_confirm_code"] = True
+        await update.message.reply_text(
+            f"Ваш код подтверждения: <b>{code}</b>\n\n"
+            "Введите этот код ниже для активации аккаунта.",
+            parse_mode="HTML",
+        )
+        return
+
+    # ---- Регистрация: ввод кода подтверждения ----
+    if context.user_data.get("awaiting_confirm_code"):
+        context.user_data["awaiting_confirm_code"] = False
+        expected = context.user_data.pop("confirm_code", "")
+        email = context.user_data.pop("confirm_email", "")
+        if user_text.strip() == expected:
+            ok = await asyncio.to_thread(_confirm_user, email)
+            if ok:
+                context.user_data["authenticated"] = True
+                context.user_data["auth_email"] = email
+                context.user_data.pop("reg_email", None)
+                await update.message.reply_text(
+                    "Аккаунт подтверждён! Регистрация завершена.\n\n"
+                    "Теперь пройдём короткую процедуру согласия.",
+                )
+                await context.bot.send_message(
+                    update.effective_chat.id,
+                    CONSENT_TEXT,
+                    parse_mode="HTML",
+                    reply_markup=_consent_keyboard(),
+                )
+            else:
+                await update.message.reply_text("Ошибка подтверждения. Попробуйте /start заново.")
+        else:
+            context.user_data["confirm_code"] = expected
+            context.user_data["confirm_email"] = email
+            context.user_data["awaiting_confirm_code"] = True
+            await update.message.reply_text("Неверный код. Попробуйте ещё раз:")
         return
 
     # Ожидаем имя клиента после /start — не отправляем в ИИ, не ищем в интернете
@@ -1021,6 +1821,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    # Запрос пациента после опроса — анализ через ИИ-диагноста
+    if context.user_data.get("awaiting_request"):
+        await _handle_patient_request(update, context, user_text)
+        return
+
+    # Ответы на уточняющие вопросы ИИ (после описания ситуации)
+    if context.user_data.get("awaiting_followup_answers"):
+        context.user_data["awaiting_followup_answers"] = False
+        context.user_data.pop("ai_followup_questions", None)
+        patient_request = context.user_data.get("patient_request", "")
+        survey_answers = context.user_data.get("completed_survey_answers") or {}
+        survey_data = _format_survey_data(survey_answers)
+        await _finish_patient_request_with_docs(
+            update, context, survey_data, patient_request, followup_answers=user_text
+        )
+        return
+
+    # Ответы на уточняющие вопросы после анализа документов
+    if context.user_data.get("awaiting_post_doc_answers"):
+        context.user_data["awaiting_post_doc_answers"] = False
+        context.user_data.pop("post_doc_followup_questions", None)
+        full_analysis = context.user_data.get("full_analysis", "")
+        if full_analysis:
+            qa_block = "Ответы пациента на уточняющие вопросы:\n" + user_text[:2000]
+            refine_prompt = REFINED_ANALYSIS_PROMPT.format(
+                full_analysis=full_analysis[:6000],
+                qa_block=qa_block,
+            )
+            await update.message.reply_text("Уточняю заключение с учётом ваших ответов…")
+            refined = await _ask_ai_text(refine_prompt, qa_block)
+            if refined:
+                refined = _strip_latex(refined)
+                context.user_data["full_analysis"] = refined
+                _save_conclusion(update.effective_user.id, refined)
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📄 Показать результаты", callback_data=CB_SHOW_RESULTS)],
+            ])
+            await update.message.reply_text(
+                "Готово. Нажмите кнопку ниже, чтобы увидеть итоговое заключение.",
+                reply_markup=keyboard,
+            )
+        return
+
     # Ответ на вопрос опросника: ввёл текст и нажал Enter — сохраняем и сразу показываем следующий вопрос
     survey_step = context.user_data.get("survey_step")
     if survey_step and 1 <= survey_step <= len(MEDICAL_QUESTIONS):
@@ -1030,11 +1873,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data["survey_answers"][f"q{survey_step}"] = answer_val
         sheet_row = context.user_data.get("survey_sheet_row")
         if sheet_row is not None:
-            await asyncio.to_thread(_sheet_update_cell, sheet_row, f"q{survey_step}", answer_val)
-            if survey_step == 1:
-                await asyncio.to_thread(_sheet_update_cell, sheet_row, "fio", answer_val)
-            elif survey_step == 2:
-                await asyncio.to_thread(_sheet_update_cell, sheet_row, "birth_year", answer_val)
+            await asyncio.to_thread(_sheet_update_answer, sheet_row, survey_step, answer_val)
         chat_id = update.effective_chat.id
         bot = context.bot
         msg_id = context.user_data.get("survey_question_message_id")
@@ -1047,30 +1886,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         total = len(MEDICAL_QUESTIONS)
         if next_step <= total:
             context.user_data["survey_step"] = next_step
-            q_text = _format_medical_question(next_step, total)
-            sent = await bot.send_message(
-                chat_id, q_text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove()
-            )
+            sent = await _send_survey_question(bot, chat_id, next_step, total)
             context.user_data["survey_question_message_id"] = sent.message_id
         else:
-            answers = context.user_data.get("survey_answers") or {}
             user_id_sheet = context.user_data.pop("survey_sheet_id", None)
+            saved_answers = dict(context.user_data.get("survey_answers") or {})
             context.user_data.pop("survey_step", None)
             context.user_data.pop("survey_answers", None)
             context.user_data.pop("survey_question_message_id", None)
             context.user_data.pop("survey_sheet_row", None)
+            context.user_data["completed_survey_answers"] = saved_answers
+            context.user_data["awaiting_request"] = True
             await bot.send_message(
                 chat_id,
-                "Спасибо! Опрос завершён. Теперь можно присылать анализы и документы — учту ваши ответы при разборе.",
+                _survey_done_message(user_id_sheet),
+                parse_mode="HTML",
                 reply_markup=MAIN_KEYBOARD,
             )
-            if user_id_sheet is not None:
-                await bot.send_message(
-                    chat_id,
-                    f"<b>Ваш уникальный ID:</b> {user_id_sheet}\n\nСохраните его — он привязан к ФИО и дате рождения.",
-                    parse_mode="HTML",
-                    reply_markup=MAIN_KEYBOARD,
-                )
         return
 
     # Кнопки: Старт, Стоп, Перезапустить, Добавить фото, Диагноз, Лечение
@@ -1206,6 +2038,461 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
 
+async def _handle_patient_request(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Обработка запроса пациента: первичный или follow-up после анализа."""
+    context.user_data["awaiting_request"] = False
+    context.user_data["patient_request"] = text[:2000]
+
+    survey_answers = context.user_data.get("completed_survey_answers") or {}
+    survey_data = _format_survey_data(survey_answers)
+    previous_analysis = context.user_data.get("full_analysis", "")
+
+    if previous_analysis:
+        await update.message.reply_text("Анализирую ваш вопрос с учётом предыдущих данных…")
+        prompt = FOLLOWUP_PROMPT.format(
+            survey_data=survey_data,
+            previous_analysis=previous_analysis[:3000],
+            followup_question=text,
+        )
+        ai_response = await _ask_ai_text(prompt, text)
+        if not ai_response:
+            ai_response = "К сожалению, не удалось обработать запрос. Попробуйте переформулировать."
+
+        ai_response = _strip_latex(ai_response)
+
+        context.user_data["collecting_docs"] = True
+        user_id = update.effective_user.id
+        _pending.pop(user_id, None)
+
+        send_docs_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📎 Загрузить документы", callback_data=CB_SEND_DOCS)],
+        ])
+        await update.message.reply_text(ai_response, reply_markup=MAIN_KEYBOARD)
+
+        continue_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Продолжить", callback_data=CB_CONTINUE_YES),
+                InlineKeyboardButton("🏁 Закончить", callback_data=CB_CONTINUE_NO),
+            ],
+        ])
+        await update.message.reply_text(
+            "Вы можете загрузить дополнительные документы для более точного анализа "
+            "или задать ещё вопрос.\n\nХотите продолжить?",
+            reply_markup=continue_kb,
+        )
+        return
+
+    # Первичный запрос: ИИ задаёт 1–5 уточняющих вопросов для более точного анализа
+    await update.message.reply_text("Анализирую ваш запрос…")
+    clarify_prompt = CLARIFY_QUESTIONS_PROMPT.format(
+        survey_data=survey_data,
+        patient_request=text[:1500],
+    )
+    questions_raw = await _ask_ai_text(clarify_prompt, text[:500])
+    questions_list = _parse_questions_from_ai(questions_raw) if questions_raw else []
+
+    if questions_list:
+        context.user_data["ai_followup_questions"] = questions_list
+        context.user_data["awaiting_followup_answers"] = True
+        questions_text = "\n".join(f"• {q}" for q in questions_list)
+        await update.message.reply_text(
+            "Чтобы лучше понять ситуацию и дать более точные рекомендации, ответьте, пожалуйста, на несколько вопросов:\n\n"
+            f"{questions_text}\n\n"
+            "Напишите ответы одним сообщением (можно по порядку или кратко).",
+            parse_mode="HTML",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    # Нет вопросов или ИИ не вернул — сразу запрашиваем документы
+    await _finish_patient_request_with_docs(update, context, survey_data, text, followup_answers="")
+
+
+async def _finish_patient_request_with_docs(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    survey_data: str,
+    patient_request: str,
+    followup_answers: str,
+) -> None:
+    """После ответов на уточняющие вопросы (или без них): анализ запроса, список документов, кнопка загрузки."""
+    followup_qa = ""
+    if followup_answers and followup_answers.strip():
+        followup_qa = "\n\nОТВЕТЫ ПАЦИЕНТА НА УТОЧНЯЮЩИЕ ВОПРОСЫ:\n" + followup_answers.strip()[:2000]
+
+    prompt = REQUEST_ANALYSIS_PROMPT.format(
+        survey_data=survey_data,
+        patient_request=patient_request,
+        followup_qa=followup_qa,
+    )
+    await update.message.reply_text("Анализирую ваш запрос…")
+    ai_response = await _ask_ai_text(prompt, patient_request[:500])
+    if not ai_response:
+        ai_response = (
+            "Пожалуйста, загрузите имеющиеся медицинские документы:\n\n"
+            "📋 Анализы\n📋 Выписной эпикриз\n📋 Заключения врачей\n"
+            "📋 Назначения и рецепты\n📋 Результаты обследований"
+        )
+
+    context.user_data["collecting_docs"] = True
+    user_id = update.effective_user.id
+    _pending.pop(user_id, None)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📎 Отправить документы на анализ", callback_data=CB_SEND_DOCS)],
+    ])
+    await update.message.reply_text(
+        f"{ai_response}\n\n"
+        "Загрузите документы (фото или файлы). Когда всё прикрепите — нажмите кнопку ниже.",
+        reply_markup=keyboard,
+    )
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Голосовое сообщение: транскрибируем и обрабатываем как текст."""
+    voice = update.message.voice
+    if not voice:
+        return
+    try:
+        tg_file = await context.bot.get_file(voice.file_id)
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        buf.seek(0)
+        voice_bytes = buf.read()
+    except Exception as e:
+        logger.warning("Не удалось скачать голосовое: %s", e)
+        await update.message.reply_text("Не удалось загрузить голосовое сообщение. Попробуйте ещё раз.")
+        return
+
+    await update.message.reply_text("Распознаю голос…")
+    text = await asyncio.to_thread(_transcribe_voice_sync, voice_bytes)
+    if not text:
+        await update.message.reply_text(
+            "Не удалось распознать речь. Попробуйте записать ещё раз или напишите текстом."
+        )
+        return
+    await update.message.reply_text(f"Распознано: <i>{_escape_html(text[:500])}</i>", parse_mode="HTML")
+
+    if context.user_data.get("awaiting_request"):
+        await _handle_patient_request(update, context, text)
+        return
+
+    if context.user_data.get("awaiting_followup_answers"):
+        context.user_data["awaiting_followup_answers"] = False
+        context.user_data.pop("ai_followup_questions", None)
+        patient_request = context.user_data.get("patient_request", "")
+        survey_answers = context.user_data.get("completed_survey_answers") or {}
+        survey_data = _format_survey_data(survey_answers)
+        await _finish_patient_request_with_docs(
+            update, context, survey_data, patient_request, followup_answers=text
+        )
+        return
+
+    if context.user_data.get("awaiting_post_doc_answers"):
+        context.user_data["awaiting_post_doc_answers"] = False
+        post_doc_questions = context.user_data.pop("post_doc_followup_questions", [])
+        full_analysis = context.user_data.get("full_analysis", "")
+        if full_analysis:
+            qa_block = "Ответы пациента на уточняющие вопросы:\n" + text[:2000]
+            refine_prompt = REFINED_ANALYSIS_PROMPT.format(
+                full_analysis=full_analysis[:6000],
+                qa_block=qa_block,
+            )
+            await update.message.reply_text("Уточняю заключение с учётом ваших ответов…")
+            refined = await _ask_ai_text(refine_prompt, qa_block)
+            if refined:
+                refined = _strip_latex(refined)
+                context.user_data["full_analysis"] = refined
+                _save_conclusion(update.effective_user.id, refined)
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📄 Показать результаты", callback_data=CB_SHOW_RESULTS)],
+            ])
+            await update.message.reply_text(
+                "Готово. Нажмите кнопку ниже, чтобы увидеть итоговое заключение.",
+                reply_markup=keyboard,
+            )
+        return
+
+    # Если не в режиме запроса — обрабатываем как обычный текстовый вопрос
+    has_groq = _use_groq()
+    has_openai = bool(get_openai_client())
+    if not has_groq and not has_openai:
+        await update.message.reply_text(_no_ai_message())
+        return
+    await update.message.reply_text("Думаю…")
+    response = await _ask_ai_text(TEXT_PROMPT, text)
+    if response:
+        if len(response) > 4000:
+            response = response[:3997] + "..."
+        await update.message.reply_text(response, reply_markup=MAIN_KEYBOARD)
+    else:
+        await update.message.reply_text("Не удалось получить ответ.", reply_markup=MAIN_KEYBOARD)
+
+
+def _transcribe_voice_sync(voice_bytes: bytes) -> str:
+    """Синхронная обёртка для транскрибации (вызывается через asyncio.to_thread)."""
+    buf = io.BytesIO(voice_bytes)
+    buf.name = "voice.ogg"
+    client = get_groq_client()
+    if client:
+        try:
+            result = client.audio.transcriptions.create(model="whisper-large-v3", file=buf)
+            return (result.text or "").strip()
+        except Exception as e:
+            logger.warning("Groq Whisper: %s", e)
+    buf.seek(0)
+    client = get_openai_client()
+    if client:
+        try:
+            result = client.audio.transcriptions.create(model="whisper-1", file=buf)
+            return (result.text or "").strip()
+        except Exception as e:
+            logger.warning("OpenAI Whisper: %s", e)
+    return ""
+
+
+async def handle_send_docs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка 'Отправить документы на анализ' — полный анализ."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id if query.from_user else 0
+    chat_id = query.message.chat_id
+    bot = context.bot
+
+    context.user_data["collecting_docs"] = False
+    patient_request = context.user_data.get("patient_request", "")
+    survey_answers = context.user_data.get("completed_survey_answers") or {}
+    survey_data = _format_survey_data(survey_answers)
+
+    data = _pending.pop(user_id, None)
+    file_ids = data["file_ids"] if data else []
+
+    if not file_ids:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📎 Отправить документы на анализ", callback_data=CB_SEND_DOCS)],
+        ])
+        try:
+            await query.edit_message_text(
+                "Вы ещё не загрузили документы. Прикрепите фото или файлы и нажмите кнопку снова.",
+                reply_markup=keyboard,
+            )
+        except Exception:
+            pass
+        if data:
+            _pending[user_id] = data
+        return
+
+    try:
+        await query.edit_message_text("Запускаю полный анализ…")
+    except Exception:
+        pass
+
+    images_b64: List[tuple] = []
+    for file_id, mime in file_ids:
+        try:
+            tg_file = await bot.get_file(file_id)
+            buf = io.BytesIO()
+            await tg_file.download_to_memory(buf)
+            buf.seek(0)
+            images_b64.append((base64.b64encode(buf.read()).decode("utf-8"), mime))
+        except Exception as e:
+            logger.warning("Не удалось загрузить файл %s: %s", file_id, e)
+
+    if not images_b64:
+        await bot.send_message(chat_id, "Не удалось загрузить документы. Попробуйте отправить снова.")
+        return
+
+    progress_msg = await bot.send_message(
+        chat_id, f"Анализирую ваши данные…\n\n{_progress_bar(0)}"
+    )
+    stop_event = asyncio.Event()
+    progress_task = asyncio.create_task(
+        _progress_updater(bot, chat_id, progress_msg.message_id, stop_event)
+    )
+
+    prompt = FULL_ANALYSIS_PROMPT.format(survey_data=survey_data, patient_request=patient_request)
+    user_msg = (
+        f"Запрос пациента: {patient_request}\n\n"
+        "Приложены медицинские документы. Проведи полный анализ по инструкции."
+    )
+    try:
+        analysis = await _ask_ai_with_images(prompt, user_msg, images_b64)
+    finally:
+        stop_event.set()
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=progress_msg.message_id,
+                text=f"Анализирую ваши данные…\n\n{_progress_bar(100)}",
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=progress_msg.message_id)
+        except Exception:
+            pass
+
+    if not analysis:
+        await bot.send_message(
+            chat_id,
+            "Не удалось провести анализ. Попробуйте ещё раз или загрузите документы в другом формате.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    context.user_data["full_analysis"] = analysis
+    _save_conclusion(user_id, analysis)
+
+    # Уточняющие вопросы после анализа документов для более точного заключения
+    analysis_summary = (analysis[:1500] + "…") if len(analysis) > 1500 else analysis
+    post_doc_prompt = POST_DOC_QUESTIONS_PROMPT.format(
+        patient_request=patient_request or "Не указан",
+        analysis_summary=analysis_summary,
+    )
+    questions_raw = await _ask_ai_text(post_doc_prompt, analysis_summary[:500])
+    post_doc_questions = _parse_questions_from_ai(questions_raw) if questions_raw else []
+
+    if post_doc_questions:
+        context.user_data["post_doc_followup_questions"] = post_doc_questions
+        context.user_data["awaiting_post_doc_answers"] = True
+        questions_text = "\n".join(f"• {q}" for q in post_doc_questions)
+        await bot.send_message(
+            chat_id,
+            "<b>✅ АНАЛИЗ ВЫПОЛНЕН</b>\n\n"
+            "Чтобы уточнить заключение и рекомендации, ответьте, пожалуйста, на несколько вопросов:\n\n"
+            f"{questions_text}\n\n"
+            "Напишите ответы текстом или голосовым сообщением (можно одним сообщением).",
+            parse_mode="HTML",
+            reply_markup=MAIN_KEYBOARD,
+        )
+    else:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📄 Показать результаты", callback_data=CB_SHOW_RESULTS)],
+        ])
+        await bot.send_message(
+            chat_id,
+            "<b>✅ АНАЛИЗ ВЫПОЛНЕН</b>\n\nЯ готов вывести результаты на экран.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+
+async def handle_show_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка 'Показать результаты' — вывод полного анализа."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    bot = context.bot
+
+    analysis = context.user_data.get("full_analysis", "")
+    if not analysis:
+        await bot.send_message(chat_id, "Результаты анализа не найдены.", reply_markup=MAIN_KEYBOARD)
+        return
+
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    if len(analysis) > 4000:
+        analysis = analysis[:3997] + "..."
+    formatted = _format_conclusion_for_elderly(analysis)
+    await bot.send_message(
+        chat_id,
+        formatted,
+        parse_mode="HTML",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+    continue_kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да, продолжить", callback_data=CB_CONTINUE_YES),
+            InlineKeyboardButton("❌ Нет, спасибо", callback_data=CB_CONTINUE_NO),
+        ],
+    ])
+    await bot.send_message(
+        chat_id,
+        "Хотите продолжить?",
+        reply_markup=continue_kb,
+    )
+
+
+async def handle_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка кнопок 'Да, продолжить' / 'Нет, спасибо' после анализа."""
+    query = update.callback_query
+    await query.answer()
+    data = (query.data or "").strip()
+    chat_id = query.message.chat_id
+    bot = context.bot
+
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    if data == CB_CONTINUE_YES:
+        context.user_data["collecting_docs"] = True
+        context.user_data["awaiting_request"] = True
+        await bot.send_message(
+            chat_id,
+            "Отлично! Вы можете:\n\n"
+            "  — задать вопрос текстом или голосовым сообщением\n"
+            "  — загрузить дополнительные документы или фото\n\n"
+            "Я отвечу на ваш вопрос и учту новые данные в анализе.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+    elif data == CB_CONTINUE_NO:
+        context.user_data.pop("full_analysis", None)
+        context.user_data.pop("collecting_docs", None)
+        context.user_data.pop("awaiting_request", None)
+        context.user_data.pop("completed_survey_answers", None)
+        context.user_data.pop("patient_request_text", None)
+        await bot.send_message(
+            chat_id,
+            "Благодарю вас за доверие! Берегите себя и будьте здоровы. 🙏\n\n"
+            "Если понадобится помощь — я всегда рядом. "
+            "Просто напишите /start, и мы начнём консультацию в любое удобное для вас время.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+
+
+async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пользователь поделился контактом — сохраняем телефон в таблицу."""
+    contact = update.message.contact
+    if not contact or not contact.phone_number:
+        return
+    phone = contact.phone_number
+    context.user_data["tg_phone"] = phone
+    sheet_row = context.user_data.get("survey_sheet_row")
+    if sheet_row:
+        await asyncio.to_thread(
+            lambda: _sheet_update_phone(sheet_row, phone)
+        )
+    await update.message.reply_text(
+        f"Спасибо! Номер {phone} сохранён.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+def _sheet_update_phone(row_index: int, phone: str) -> Optional[str]:
+    """Записывает номер телефона в столбец D (телефон)."""
+    try:
+        wks, err = _get_sheet_wks()
+        if wks is None:
+            return err
+        wks.update_cell(row_index, 4, phone)
+        return None
+    except Exception as e:
+        _sheet_cache["wks"] = None
+        return str(e)[:200]
+
+
 def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -1215,17 +2502,23 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(handle_auth_choice, pattern="^auth:"))
     app.add_handler(CallbackQueryHandler(handle_flow_start, pattern="^flow:"))
     app.add_handler(CallbackQueryHandler(handle_consent, pattern="^consent:"))
     app.add_handler(CallbackQueryHandler(handle_ai_choice, pattern="^ai:"))
     app.add_handler(CallbackQueryHandler(handle_next_step, pattern="^next:"))
-    app.add_handler(CallbackQueryHandler(handle_survey_send, pattern="^survey:"))
+    app.add_handler(CallbackQueryHandler(handle_survey_callback, pattern="^survey:"))
+    app.add_handler(CallbackQueryHandler(handle_send_docs, pattern="^docs:"))
+    app.add_handler(CallbackQueryHandler(handle_show_results, pattern="^results:"))
+    app.add_handler(CallbackQueryHandler(handle_continue, pattern="^continue:"))
+    app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Бот запущен (опросник: %d вопросов)", len(MEDICAL_QUESTIONS))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
